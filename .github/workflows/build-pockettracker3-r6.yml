@@ -1,0 +1,186 @@
+name: Build PocketTracker 3 R6 - RG28XX
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'PocketTracker3_R6_Source.zip'
+      - '.github/workflows/build-pockettracker3-r6.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pockettracker3-r6-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  portmaster:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SOURCE_FILE: PocketTracker3_R6_Source.zip
+      SOURCE_SHA256: c34b16be3cee0d4e2d53f2d69748c6f5cf02dc089353508b9b3ea67e05c32b36
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify the source ZIP and extract its single project root
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-logs
+          python3 - "$SOURCE_FILE" "$SOURCE_SHA256" <<'PY' 2>&1 | tee ci-logs/source.log
+          import hashlib, pathlib, stat, sys, zipfile
+          source = pathlib.Path(sys.argv[1])
+          assert source.is_file(), 'Upload PocketTracker3_R6_Source.zip intact at the repository root'
+          assert hashlib.sha256(source.read_bytes()).hexdigest() == sys.argv[2], 'Source ZIP checksum mismatch'
+          with zipfile.ZipFile(source) as z:
+              assert z.testzip() is None, 'Corrupt source ZIP'
+              assert len(z.namelist()) == len(set(z.namelist())), 'Duplicate ZIP member'
+              for entry in z.infolist():
+                  p = pathlib.PurePosixPath(entry.filename)
+                  assert not p.is_absolute() and '..' not in p.parts and '\\' not in entry.filename, entry.filename
+                  assert p.parts and p.parts[0] == 'PocketTracker3', 'Wrong source root'
+                  assert not stat.S_ISLNK(entry.external_attr >> 16), 'Unexpected source symlink'
+              z.extractall('source')
+          print('PASS: source checksum, CRC, root and safe extraction')
+          PY
+          python3 source/PocketTracker3/tools/verify_source_archive.py "$SOURCE_FILE" "$SOURCE_SHA256" \
+            2>&1 | tee ci-logs/source-manifest.log
+
+      - name: Check bundled dependencies and project version
+        shell: bash
+        working-directory: source/PocketTracker3
+        run: |
+          set -euo pipefail
+          test "$(cat native/vendor/mutable/plaits/PT-UPSTREAM-REVISION)" = '08460a69a7e1f7a81c5a2abcc7189c9a6b7208d4'
+          test "$(cat build-support/SDL2/PT-UPSTREAM-REVISION)" = '2e9821423a237a1206e3c09020778faacfe430be'
+          test "$(head -1 RELEASE_ID.txt)" = 'PT3 R6'
+          test "$(cat native/vendor/mdmm/UPSTREAM_REVISION)" = 'b43e9071015c6c7ec2cafa9ff8a060e9f43a3486'
+          cmake -P native/cmake/pt_version.cmake 2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/version.log"
+
+      - name: Test DSP, polyphony, MIDI and FX, recording, modulation and package policy
+        shell: bash
+        working-directory: source/PocketTracker3
+        run: |
+          set -euo pipefail
+          bash tools/ci_host_checks.sh "$GITHUB_WORKSPACE/ci-logs" \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/host-checks.log"
+
+      - name: Build host engine and check synths, FX, recording, MIDI and presets
+        shell: bash
+        working-directory: source/PocketTracker3
+        run: |
+          set -euo pipefail
+          cmake -S native -B build/host -DCMAKE_BUILD_TYPE=Release \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/host-configure.log"
+          cmake --build build/host --parallel 2 \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/host-build.log"
+          bash tests/run_fx_picker_dispatch.sh build/host \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/fx-picker-dispatch.log"
+          bash tests/run_open303_integration.sh build/host build/open303-factory \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/open303-tracker-integration.log"
+          bash tests/run_fm_machine_integration.sh build/host \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/fm-machine-integration.log"
+          bash tests/run_tape_ui_integration.sh build/host \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/tape-ui-integration.log"
+          bash tests/run_machine_integration.sh build/host \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/md-mnm-integration.log"
+          bash tests/run_audio_io_session_integration.sh build/host \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/audio-io-integration.log"
+          bash tests/run_midi_usb_recovery.sh build/host \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/midi-usb-recovery.log"
+          cp -a factory build/factory-check
+          bash tools/make_tone_bank.sh build/host build/factory-check build/tone-check \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/tone-bank.log"
+
+      - name: Build the full ARM64 app at the PortMaster compatibility floor
+        shell: bash
+        working-directory: source/PocketTracker3
+        run: |
+          set -euo pipefail
+          docker build --progress=plain -t pockettracker3-build -f shell/Dockerfile.portmaster shell/ \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/docker.log"
+          docker run --rm -v "$PWD:/src" -e SRC=/src -e CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            pockettracker3-build bash /src/shell/build-portmaster.sh \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/arm64-build.log"
+
+      - name: Execute ARM64 synth, recording, MIDI and SDL conversion checks
+        shell: bash
+        working-directory: source/PocketTracker3
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/src" \
+            -e CXX=aarch64-linux-gnu-g++ \
+            -e PT_QEMU_AARCH64=/usr/bin/qemu-aarch64-static \
+            -e PT_ARM_SYSROOT=/usr/aarch64-linux-gnu \
+            pockettracker3-build bash -lc '
+              set -euo pipefail
+              cd /src
+              bash tests/run_machine_integration.sh build/aarch64/native build/machine-arm
+              bash tests/run_audio_io_session_integration.sh build/aarch64/native build/audio-arm
+              bash tests/run_midi_usb_recovery.sh build/aarch64/native build/midi-arm
+              bash tests/run_sdl_usb_audio_integration.sh build/aarch64/native /usr/aarch64-linux-gnu /usr/bin/qemu-aarch64-static build/sdl-usb-arm
+            ' 2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/arm64-integration.log"
+
+      - name: Verify and package the actual ARM64 binary
+        shell: bash
+        working-directory: source/PocketTracker3
+        env:
+          PT_SOURCE_SHA256: ${{ env.SOURCE_SHA256 }}
+        run: |
+          set -euo pipefail
+          python3 tools/verify_mutable.py build/portmaster/stage/pockettracker/pockettracker.aarch64 \
+            2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/real-elf.log"
+          python3 tools/package_port.py 2>&1 | tee "$GITHUB_WORKSPACE/ci-logs/package.log"
+          test -s release/pockettracker3_r6.zip
+          unzip -t release/pockettracker3_r6.zip > "$GITHUB_WORKSPACE/ci-logs/install-zip.log"
+
+      - name: Upload the compiled PortMaster package
+        id: compiled
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketTracker3-R6-RG28XX-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            source/PocketTracker3/release/pockettracker3_r6.zip
+            source/PocketTracker3/release/BUILD_INFO.json
+            source/PocketTracker3/release/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Write build result and first error lines
+        if: ${{ always() }}
+        shell: bash
+        env:
+          BUILD_STATUS: ${{ job.status }}
+          PACKAGE_URL: ${{ steps.compiled.outputs.artifact-url }}
+        run: |
+          mkdir -p ci-logs
+          python3 - <<'PY'
+          import os, pathlib, re
+          lines = ['# PocketTracker 3 — PT3 R6', '', 'Result: ' + os.environ['BUILD_STATUS'], '']
+          url = os.environ.get('PACKAGE_URL', '')
+          lines += ['[Download the compiled PortMaster artifact](' + url + ')' if url else 'No compiled package was produced; open the first failing step and the diagnostic artifact.']
+          lines += ['', 'Extract the Actions artifact once to obtain pockettracker3_r6.zip. Install that inner ZIP into your ports folder.']
+          errors = []
+          for p in sorted(pathlib.Path('ci-logs').glob('*.log')):
+              for line in p.read_text(errors='replace').splitlines():
+                  if re.search(r'error:|fatal:|CMake Error|undefined reference|FAILED:|Traceback|AssertionError', line):
+                      errors.append(p.name + ': ' + line)
+          if errors:
+              lines += ['', '```text'] + errors[:60] + ['```']
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('\n'.join(lines) + '\n')
+          print('\n'.join(errors[:60]))
+          PY
+
+      - name: Save diagnostic logs on success or failure
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketTracker3-R6-DIAGNOSTICS-${{ github.run_number }}-${{ github.run_attempt }}
+          path: ci-logs/
+          if-no-files-found: warn
+          retention-days: 30
