@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 90
     env:
       SOURCE_FILE: PocketTracker3_R6_Source.zip
-      SOURCE_SHA256: c34b16be3cee0d4e2d53f2d69748c6f5cf02dc089353508b9b3ea67e05c32b36
+      SOURCE_SHA256: 5b4af136c33be7dd2ff7076b7575d096e6877f8720ee7edc12ae90fcc22d9b98
     steps:
       - name: Checkout
         uses: actions/checkout@v4
